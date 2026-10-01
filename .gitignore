@@ -1,0 +1,7 @@
+# Secrets — ne jamais committer
+.env
+.env.*
+*.bak
+*.log
+*.key
+id_*
