@@ -7,6 +7,7 @@
 #    effet) et PID 1 relance le cycle pendant des heures — CPU à fond, ventilateurs
 #    au maximum, plus aucune session possible (SSH compris), aucun redémarrage à
 #    distance. Constaté le 14/10/2026 sur ce Dell (voir README).
+#    Machine non saine et inoccupée -> redémarrage automatique, plafonné à 3 par 24 h.
 # À lancer sur le Dell avec sudo.
 set -e
 IDLE_MIN="${IDLE_MIN:-15}"
@@ -34,9 +35,11 @@ cat > /usr/local/bin/dell-idle-suspend <<'EOF'
 # demandee sur un GNOME figé (GPU en Xid 154) a echoue (systemd-suspend status=1),
 # laisse logind increvable et fait boucler PID 1 pendant 9 h : 23 000 lignes de
 # journal, CPU a fond, ventilateurs au maximum, plus aucune session (SSH compris).
+# Machine non saine et inoccupee -> redemarrage automatique (un Xid 154 ne se
+# repare que par un redemarrage), plafonne a 3 par 24 h puis alerte seule.
 #
-#   --check   n'agit pas, affiche seulement le verdict (sante/busy), exit 1 si
-#             la machine n'est pas saine. Sert a verifier le garde-fou.
+#   --check   n'agit pas, affiche le verdict (sante / busy / redemarrages_24h),
+#             exit 1 si la machine n'est pas saine. Sert a verifier le garde-fou.
 set -u
 IDLE_MIN="${IDLE_MIN:-15}"
 STAMP="${STAMP:-/run/dell-idle-since}"
@@ -45,6 +48,11 @@ NVIDIA_SMI="${NVIDIA_SMI:-nvidia-smi}"      # surchargeables : permettent de tes
 JOURNALCTL="${JOURNALCTL:-journalctl}"      # le garde-fou sans toucher au materiel
 SUSPEND_CMD="${SUSPEND_CMD:-systemctl suspend}"
 TRACE_DIR="${TRACE_DIR:-/var/lib/dell-guard}"
+AUTO_DIR="${AUTO_DIR:-$TRACE_DIR}"
+AUTO_LOG="$AUTO_DIR/redemarrages.log"
+REBOOT_CMD="${REBOOT_CMD:-systemctl reboot}"
+MAX_REBOOTS="${MAX_REBOOTS:-3}"    # plafond de redemarrages sur 24 h, puis alerte seule
+MIN_UPTIME="${MIN_UPTIME:-900}"    # pas de redemarrage dans les 15 premieres minutes
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
@@ -92,7 +100,8 @@ for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '$4=="seat0"{p
 done
 
 if [ "$CHECK_ONLY" = "1" ]; then
-  echo "sante=${problems:-ok} busy=$busy"
+  nb=$(cat "$AUTO_LOG" 2>/dev/null | wc -l)   # 0 si le fichier n'existe pas encore
+  echo "sante=${problems:-ok} busy=$busy redemarrages_24h=$nb/$MAX_REBOOTS"
   [ -n "$problems" ] && exit 1 || exit 0
 fi
 
@@ -101,12 +110,34 @@ if [ "$busy" = "1" ]; then
   exit 0
 fi
 
-# ---------- 2 bis. garde-fou : machine non saine -> on ne suspend PAS ----------
+# ---------- 2 bis. garde-fou : machine non saine -> ni veille, ni attente passive ----------
 if [ -n "$problems" ]; then
   rm -f "$STAMP"
   say "GARDE-FOU: veille ANNULEE ($problems) - machine non saine"
-  mkdir -p "$TRACE_DIR" 2>/dev/null
+  mkdir -p "$TRACE_DIR" "$AUTO_DIR" 2>/dev/null
   echo "$(date -Is) veille annulee:${problems}" >> "$TRACE_DIR/historique.log" 2>/dev/null
+
+  # Redemarrage automatique : un GPU en Xid 154 ne se repare QUE par un
+  # redemarrage. Plafonne pour ne jamais boucler (3 par 24 h, puis alerte seule)
+  # et jamais dans les 15 premieres minutes de vie de la machine.
+  now=$(date +%s)
+  touch "$AUTO_LOG" 2>/dev/null
+  awk -v k=$(( now - 86400 )) '$1 >= k' "$AUTO_LOG" > "$AUTO_LOG.tmp" 2>/dev/null \
+    && mv "$AUTO_LOG.tmp" "$AUTO_LOG"
+  n=$(wc -l < "$AUTO_LOG" 2>/dev/null || echo 0)
+  up=$(cut -d. -f1 /proc/uptime)
+  if [ "$n" -ge "$MAX_REBOOTS" ]; then
+    say "GARDE-FOU: plafond atteint ($n redemarrages/24 h) - alerte seule, plus de redemarrage"
+    echo "$(date -Is) ALERTE plafond atteint ($problems)" >> "$TRACE_DIR/historique.log" 2>/dev/null
+  elif [ "$up" -lt "$MIN_UPTIME" ]; then
+    say "GARDE-FOU: redemarrage reporte (machine demarree depuis ${up}s < ${MIN_UPTIME}s)"
+    echo "$(date -Is) redemarrage reporte (uptime ${up}s, $problems)" >> "$TRACE_DIR/historique.log" 2>/dev/null
+  else
+    say "GARDE-FOU: redemarrage automatique de la machine ($problems)"
+    echo "$(date -Is) redemarrage automatique ($problems)" >> "$TRACE_DIR/historique.log" 2>/dev/null
+    echo "$now" >> "$AUTO_LOG"
+    $REBOOT_CMD
+  fi
   exit 0
 fi
 
@@ -121,6 +152,7 @@ if [ $(( now - since )) -ge $(( IDLE_MIN * 60 )) ]; then
 fi
 EOF
 chmod +x /usr/local/bin/dell-idle-suspend
+mkdir -p /var/lib/dell-guard        # etat : historique des veilles annulees, compteur de redemarrages
 
 echo "== 3. timer systemd =="
 cat > /etc/systemd/system/dell-idle-suspend.service <<'EOF'
@@ -152,6 +184,7 @@ echo "=== VERIFICATION ==="
 systemctl is-enabled dell-idle-suspend.timer
 systemctl is-active dell-idle-suspend.timer
 ls -l /etc/polkit-1/rules.d/49-suspend-nopasswd.rules
+ls -ld /var/lib/dell-guard
 echo -n "test suspend (dry) : "
 pkcheck --action-id org.freedesktop.login1.suspend --process $$ 2>&1 | head -2 || true
 echo -n "garde-fou (--check) : "

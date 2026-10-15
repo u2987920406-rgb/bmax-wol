@@ -4,62 +4,87 @@
 # le script a tester. Depuis le BMAX :
 #
 #   cd ~/projets/bmax-wol
-#   scp -q test-guard.sh fixtures/*.sh /tmp/dell-idle-suspend.sh dell:/tmp/
-#   ssh dell 'bash /tmp/test-guard.sh'          # le mot de passe sudo arrive sur stdin
+#   scp -q test-guard.sh fixtures/*.sh ~/.hermes/cache/scratch/dell-idle-suspend.sh dell:/tmp/
+#   ssh dell 'bash /tmp/test-guard.sh'      # mot de passe sudo attendu sur stdin
 #
-# Toutes les detections sont prouvees par FICHIERS MARQUEURS, jamais en laissant
-# une vraie veille partir, et jamais par grep du journal (les lignes de commande
-# sont auditees et polluent la recherche).
+# Chaque detection est prouvee par FICHIER MARQUEUR : aucune veille et aucun
+# redemarrage reel ne partent, et jamais de grep du journal (les lignes de
+# commande sont auditees et contiennent le marqueur cherche : faux positif).
+# Les fichiers ecrits par root dans /tmp se manipulent avec sudo, sinon les
+# nettoyages echouent (bit collant) et faussent les cas suivants.
 PW=$(head -1)
 S() { sudo -S -p "" "$@" <<<"$PW"; }
 G=/tmp/dell-idle-suspend.sh
 ok=0; ko=0
 P() { echo "  PASS  $1"; ok=$((ok+1)); }
 F() { echo "  FAIL  $1"; ko=$((ko+1)); }
+has() { case "$1" in $2) P "$3";; *) F "$3 (obtenu '$1')";; esac; }
+clean() { S rm -rf /tmp/guard-trace /tmp/guard-auto; S rm -f /tmp/suspend-marked /tmp/reboot-marked /tmp/stamp-test; }
 
-# --- fixtures, executables VERIFIES ---
 mkdir -p /tmp/fakebin-gdbus /tmp/fakebin-idle
-cp /tmp/gdbus-muet.sh        /tmp/fakebin-gdbus/gdbus
-cp /tmp/ss-vide.sh           /tmp/fakebin-idle/ss
-cp /tmp/loginctl-vide.sh     /tmp/fakebin-idle/loginctl
-cp /tmp/fakebin-idle-nvidia.sh /tmp/fakebin-idle/nvidia-smi
-chmod +x /tmp/fakebin-gdbus/gdbus /tmp/fakebin-idle/* /tmp/fake-hang.sh /tmp/mark-suspend.sh $G
-echo "fixtures executables : $(for f in /tmp/fakebin-gdbus/gdbus /tmp/fakebin-idle/ss /tmp/fakebin-idle/nvidia-smi /tmp/fake-hang.sh /tmp/mark-suspend.sh $G; do test -x $f && echo -n "ok " || echo -n "KO:$f "; done)"
-echo "fixture GPU qui pend doit echouer : "; timeout -s KILL 3 /tmp/fake-hang.sh -L; echo "  rc timeout=$?"
-echo "environnement REEl : $(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | head -3 | tr '\n' ' ')"
-rm -f /tmp/suspend-marked; rm -rf /tmp/guard-trace /tmp/stamp-test
+cp /tmp/gdbus-muet.sh /tmp/fakebin-gdbus/gdbus
+cp /tmp/ss-vide.sh /tmp/fakebin-idle/ss
+cp /tmp/loginctl-vide.sh /tmp/fakebin-idle/loginctl
+cp /tmp/nvidia-smi-sain.sh /tmp/fakebin-idle/nvidia-smi
+chmod +x /tmp/fakebin-gdbus/gdbus /tmp/fakebin-idle/* /tmp/fake-hang.sh /tmp/mark-suspend.sh /tmp/mark-reboot.sh $G
+bad=0; for f in /tmp/fakebin-gdbus/gdbus /tmp/fakebin-idle/ss /tmp/fakebin-idle/nvidia-smi /tmp/fake-hang.sh /tmp/mark-suspend.sh /tmp/mark-reboot.sh $G; do test -x "$f" || { echo "  FI: $f non executable"; bad=1; }; done
+[ "$bad" = 0 ] && P "toutes les fixtures sont executables" || F "fixture(s) non executable(s)"
 
-echo "== A. etat reel =="
+common="PATH=/tmp/fakebin-idle:$PATH TRACE_DIR=/tmp/guard-trace AUTO_DIR=/tmp/guard-auto STAMP=/tmp/stamp-test IDLE_MIN=0 SUSPEND_CMD=/tmp/mark-suspend.sh REBOOT_CMD=/tmp/mark-reboot.sh"
+clean
+
+echo "== A. etat reel (--check) =="
 r=$($G --check); echo "  $r"
-case "$r" in "sante=ok "*) P "machine reelle jugee saine";; *) F "machine reelle";; esac
+has "$r" "sante=ok *redemarrages_24h=*" "machine reelle jugee saine, compteur affiche"
 
 echo "== B. shell GNOME muet =="
 r=$(PATH=/tmp/fakebin-gdbus:$PATH $G --check); rc=$?
-[ "$r" = "sante= shell_muet busy=1" ] && P "shell muet detecte ($r)" || F "attendu 'sante= shell_muet busy=1', obtenu '$r'"
-[ "$rc" = "1" ] && P "code retour 1" || F "code retour $rc au lieu de 1"
+has "$r" "sante= shell_muet*" "shell muet detecte"
+[ "$rc" = 1 ] && P "code retour 1" || F "code retour $rc"
 
 echo "== C. GPU injoignable =="
 r=$(NVIDIA_SMI=/tmp/fake-hang.sh $G --check); rc=$?
-[ "$r" = "sante= gpu_injoignable busy=1" ] && P "GPU injoignable detecte ($r)" || F "obtenu '$r'"
-[ "$rc" = "1" ] && P "code retour 1" || F "code retour $rc"
+has "$r" "sante= gpu_injoignable*" "GPU injoignable detecte"
+[ "$rc" = 1 ] && P "code retour 1" || F "code retour $rc"
 
 echo "== D. Xid fatal =="
 r=$(JOURNALCTL=/tmp/fake-xid.sh $G --check); rc=$?
-[ "$r" = "sante= xid_fatal busy=1" ] && P "Xid fatal detecte ($r)" || F "obtenu '$r'"
-[ "$rc" = "1" ] && P "code retour 1" || F "code retour $rc"
+has "$r" "sante= xid_fatal*" "Xid fatal detecte"
+[ "$rc" = 1 ] && P "code retour 1" || F "code retour $rc"
 
-echo "== E. ACTION : machine vue inoccupee + GPU injoignable -> aucune veille =="
-S env PATH=/tmp/fakebin-idle:$PATH NVIDIA_SMI=/tmp/fake-hang.sh \
-     TRACE_DIR=/tmp/guard-trace STAMP=/tmp/stamp-test IDLE_MIN=0 \
-     SUSPEND_CMD=/tmp/mark-suspend.sh $G
-echo "  execution terminee (rc=$?)"
-[ -s /tmp/guard-trace/historique.log ] && P "trace ecrite : $(cat /tmp/guard-trace/historique.log)" || F "aucune trace ecrite"
-[ -f /tmp/suspend-marked ] && F "veille DEMANDEE malgre le garde-fou" || P "aucune veille demandee"
+echo "== E. non saine + inoccupee -> aucune veille, redemarrage demande =="
+S env $common NVIDIA_SMI=/tmp/fake-hang.sh MIN_UPTIME=0 $G
+[ -f /tmp/suspend-marked ] && F "veille demandee malgre le garde-fou" || P "aucune veille demandee"
+[ -s /tmp/reboot-marked ] && P "redemarrage demande : $(cat /tmp/reboot-marked)" || F "aucun redemarrage demande"
+n=$(wc -l < /tmp/guard-auto/redemarrages.log 2>/dev/null || echo 0)
+[ "$n" = 1 ] && P "compteur de redemarrages = 1" || F "compteur = $n (attendu 1)"
+grep -q "redemarrage automatique" /tmp/guard-trace/historique.log && P "trace du redemarrage ecrite" || F "trace absente"
 
-echo "== F. ANTI-REGRESSION : machine inoccupee et saine -> la veille part =="
-S env PATH=/tmp/fakebin-idle:$PATH TRACE_DIR=/tmp/guard-trace STAMP=/tmp/stamp-test IDLE_MIN=0 SUSPEND_CMD=/tmp/mark-suspend.sh $G
-S env PATH=/tmp/fakebin-idle:$PATH TRACE_DIR=/tmp/guard-trace STAMP=/tmp/stamp-test IDLE_MIN=0 SUSPEND_CMD=/tmp/mark-suspend.sh $G
-[ -s /tmp/suspend-marked ] && P "veille demandee quand tout va bien : $(cat /tmp/suspend-marked)" || F "veille jamais demandee alors que la machine est saine"
-[ -f /tmp/guard-trace/historique.log ] && echo "  (note: trace presente aussi en F)"; 
+echo "== F. ANTI-REGRESSION : saine + inoccupee -> la veille part, pas de redemarrage =="
+S rm -f /tmp/suspend-marked /tmp/reboot-marked /tmp/stamp-test
+S env $common MIN_UPTIME=0 $G
+S env $common MIN_UPTIME=0 $G
+[ -s /tmp/suspend-marked ] && P "veille demandee quand tout va bien" || F "veille jamais demandee"
+[ -f /tmp/reboot-marked ] && F "redemarrage demande alors que la machine est saine" || P "aucun redemarrage quand tout va bien"
+
+echo "== G. PLAFOND : 3 redemarrages en 24 h -> alerte seule =="
+S rm -f /tmp/reboot-marked; S mkdir -p /tmp/guard-auto
+now=$(date +%s); printf '%s\n%s\n%s\n' $((now-3)) $((now-2)) $((now-1)) > /tmp/seed-auto
+S cp /tmp/seed-auto /tmp/guard-auto/redemarrages.log
+S env $common NVIDIA_SMI=/tmp/fake-hang.sh MIN_UPTIME=0 $G
+[ -f /tmp/reboot-marked ] && F "redemarrage malgre le plafond" || P "plafond respecte (aucun redemarrage)"
+grep -q "ALERTE plafond atteint" /tmp/guard-trace/historique.log && P "alerte tracee" || F "alerte non tracee"
+n=$(wc -l < /tmp/guard-auto/redemarrages.log); [ "$n" = 3 ] && P "compteur inchange (3)" || F "compteur = $n"
+
+echo "== H. REPORT : machine trop jeune -> pas de redemarrage =="
+S rm -f /tmp/reboot-marked
+S rm -f /tmp/guard-auto/redemarrages.log
+S env $common NVIDIA_SMI=/tmp/fake-hang.sh MIN_UPTIME=999999 $G
+[ -f /tmp/reboot-marked ] && F "redemarrage malgre la jeunesse de la machine" || P "redemarrage reporte (jeune machine)"
+grep -q "redemarrage reporte" /tmp/guard-trace/historique.log && P "report trace" || F "report non trace"
+
+echo "== I. une trace existe bien dans le dossier d'etat du VRAI deploiement =="
+ls -ld /var/lib/dell-guard 2>/dev/null && P "/var/lib/dell-guard present" || F "/var/lib/dell-guard absent"
+
 echo "TOTAL: $ok PASS / $ko FAIL"
-[ "$ko" = "0" ]
+[ "$ko" = 0 ]

@@ -49,17 +49,28 @@ Chaîne réelle de la panne, relevée dans le journal :
 | pas de `Xid 154/79/48/62` dans le noyau de ce boot | `xid_fatal` |
 | `org.gnome.Shell` répond à une introspection D-Bus en moins de 6 s | `shell_muet` |
 
-Machine non saine → **veille annulée**, message dans le journal, trace dans
-`/var/lib/dell-guard/historique.log`. Vérification à tout moment :
+Machine non saine **et inoccupée** → la veille est annulée, une trace est écrite
+dans `/var/lib/dell-guard/historique.log`, et la machine **redémarre d'elle-même**
+(un `Xid 154` ne se répare que par un redémarrage). Garde-fous anti-boucle : jamais
+de redémarrage dans les 15 premières minutes de vie de la machine, et **3 par 24 h
+maximum** — au-delà, alerte seule dans l'historique.
+
+Au moindre doute : `--check` n'agit pas, il rend le verdict.
 
 ```bash
-/usr/local/bin/dell-idle-suspend --check    # "sante=ok busy=1" (exit 0) ou "sante= gpu_injoignable" (exit 1)
+/usr/local/bin/dell-idle-suspend --check
+# sante=ok busy=1 redemarrages_24h=0/3   -> exit 0
+# sante= gpu_injoignable busy=0 redemarrages_24h=0/3 -> exit 1
 ```
 
-Le banc de test complet (fixtures pour les trois détections, + anti-régression
-« la veille part quand tout va bien ») : `test-guard.sh` — **10 PASS / 0 FAIL** le
-15/10/2026. Il teste par fichiers marqueurs, jamais en laissant une vraie veille
-partir.
+**Limite connue** : une connexion SSH établie compte comme « occupé », même si elle
+est elle-même bloquée. Le garde-fou ne redémarrera donc pas la machine pendant une
+intervention à distance — c'est voulu.
+
+Banc de test : `test-guard.sh` + `fixtures/` — **20 PASS / 0 FAIL** le 15/10/2026
+(les trois détections, le redémarrage, le plafond, le report, et la contre-épreuve
+« la veille part quand tout va bien »). Tout est prouvé par fichiers marqueurs :
+aucune veille et aucun redémarrage réels ne partent pendant les tests.
 
 ## Mise en place (une fois, avec `sudo` sur le Dell)
 
